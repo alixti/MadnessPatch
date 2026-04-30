@@ -16,6 +16,7 @@
 #include "Controller.hpp"
 #include "helper.hpp"
 #include <shlwapi.h>
+#include "FixIniBindings.hpp"
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "SDL3-static.lib")
@@ -316,54 +317,6 @@ static float ScaleFOV(float fovDeg, float sourceAspect, float targetAspect)
 	return 2.0f * atanf((targetAspect / sourceAspect) * baseTan) * (180.0f / M_PI);
 }
 
-static std::wstring FixPipeSpacing(const std::wstring& input)
-{
-	std::wstring result;
-	result.reserve(input.length() + 16);
-	size_t i = 0;
-
-	// Skip leading pipes and spaces
-	while (i < input.length() && (input[i] == L'|' || input[i] == L' ' || input[i] == L'\t'))
-	{
-		i++;
-	}
-
-	for (; i < input.length(); i++)
-	{
-		if (input[i] == L'|')
-		{
-			// Remove trailing spaces
-			while (!result.empty() && result.back() == L' ')
-			{
-				result.pop_back();
-			}
-
-			result += L' ';
-			result += L'|';
-
-			// Skip spaces after pipe
-			while (i + 1 < input.length() && (input[i + 1] == L' ' || input[i + 1] == L'\t'))
-			{
-				i++;
-			}
-
-			result += L' ';
-		}
-		else
-		{
-			result += input[i];
-		}
-	}
-
-	// Remove trailing spaces
-	while (!result.empty() && result.back() == L' ')
-	{
-		result.pop_back();
-	}
-
-	return result;
-}
-
 static void ReplaceConfigString(safetyhook::Context& ctx, const wchar_t* newString)
 {
 	std::wstring str(newString);
@@ -376,69 +329,57 @@ static void ReplaceConfigString(safetyhook::Context& ctx, const wchar_t* newStri
 		wasModified = true;
 	}
 
-	// Check if this is a config line that needs pipe spacing fixes or command modifications
-	if (str.find(L"(Name=") != std::wstring::npos && str.find(L",Command=") != std::wstring::npos)
+	// Handle SkipCutscenesWithEnter
+	if (SkipCutscenesWithEnter && str.find(L"(Name=") != std::wstring::npos && str.find(L",Command=") != std::wstring::npos)
 	{
-		// Find the Command=" part
 		size_t commandPos = str.find(L",Command=\"");
 		if (commandPos != std::wstring::npos)
 		{
-			commandPos += 10; // Move past ',Command="'
+			commandPos += 10;
 
-			// Find the closing quote
 			size_t endQuotePos = str.find(L'"', commandPos);
 			if (endQuotePos != std::wstring::npos)
 			{
-				// Extract the command value
 				std::wstring commandValue = str.substr(commandPos, endQuotePos - commandPos);
 				std::wstring originalCommandValue = commandValue;
 
-				// Handle SkipCutscenesWithEnter
-				if (SkipCutscenesWithEnter)
+				// Check if this is the SpaceBar binding
+				if (str.find(L"(Name=\"SpaceBar\"") != std::wstring::npos)
 				{
-					// Check if this is the SpaceBar binding
-					if (str.find(L"(Name=\"SpaceBar\"") != std::wstring::npos)
+					// Remove "TryToCancelMatinee" from the command
+					size_t pos = commandValue.find(L"TryToCancelMatinee");
+					if (pos != std::wstring::npos)
 					{
-						// Remove "TryToCancelMatinee" from the command
-						size_t pos = commandValue.find(L"TryToCancelMatinee");
-						if (pos != std::wstring::npos)
+						size_t startPos = pos;
+						size_t endPos = pos + wcslen(L"TryToCancelMatinee");
+
+						// Remove trailing " | "
+						if (endPos + 3 <= commandValue.length() && commandValue.substr(endPos, 3) == L" | ")
 						{
-							size_t startPos = pos;
-							size_t endPos = pos + wcslen(L"TryToCancelMatinee");
-
-							// Remove trailing " | "
-							if (endPos + 3 <= commandValue.length() && commandValue.substr(endPos, 3) == L" | ")
-							{
-								endPos += 3;
-							}
-							// Or remove leading " | "
-							else if (startPos >= 3 && commandValue.substr(startPos - 3, 3) == L" | ")
-							{
-								startPos -= 3;
-							}
-
-							commandValue = commandValue.substr(0, startPos) + commandValue.substr(endPos);
+							endPos += 3;
 						}
+						// Or remove leading " | "
+						else if (startPos >= 3 && commandValue.substr(startPos - 3, 3) == L" | ")
+						{
+							startPos -= 3;
+						}
+
+						commandValue = commandValue.substr(0, startPos) + commandValue.substr(endPos);
 					}
-					// Check if this is the Enter binding
-					else if (str.find(L"(Name=\"Enter\"") != std::wstring::npos)
+				}
+				// Check if this is the Enter binding
+				else if (str.find(L"(Name=\"Enter\"") != std::wstring::npos)
+				{
+					// Add "TryToCancelMatinee" if not already present
+					if (commandValue.find(L"TryToCancelMatinee") == std::wstring::npos)
 					{
-						// Add "TryToCancelMatinee" if not already present
-						if (commandValue.find(L"TryToCancelMatinee") == std::wstring::npos)
-						{
-							// Add to the beginning
-							commandValue = L"TryToCancelMatinee | " + commandValue;
-						}
+						commandValue = L"TryToCancelMatinee | " + commandValue;
 					}
 				}
 
-				// Fix pipe spacing
-				std::wstring fixedCommand = FixPipeSpacing(commandValue);
-
-				// Check if anything changed
-				if (fixedCommand != originalCommandValue)
+				if (commandValue != originalCommandValue)
 				{
-					str = str.substr(0, commandPos) + fixedCommand + str.substr(endQuotePos);
+					str = str.substr(0, commandPos) + commandValue + str.substr(endQuotePos);
 					wasModified = true;
 				}
 			}
@@ -1829,6 +1770,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 			{
 				SystemHelper::LoadProxyLibrary();
 			}
+
+			FixIniBindings::FixAll();
 
 			hkCreateMutexW = HookHelper::CreateHookAPI(L"kernel32.dll", "CreateMutexW", &CreateMutexW_Hook);
 			break;
