@@ -310,6 +310,12 @@ static DWORD ScanModuleSignature(HMODULE Module, std::string_view Signature, con
 	return Address;
 }
 
+static float ScaleFOV(float fovDeg, float sourceAspect, float targetAspect)
+{
+	float baseTan = tanf((fovDeg * 0.5f) * (M_PI / 180.0f));
+	return 2.0f * atanf((targetAspect / sourceAspect) * baseTan) * (180.0f / M_PI);
+}
+
 static std::wstring FixPipeSpacing(const std::wstring& input)
 {
 	std::wstring result;
@@ -1006,19 +1012,15 @@ static void __fastcall UpdateViewportRHI_Hook(int thisp, int, int a2, int NewSiz
 
 	if (FixUltraWideScreenFOV)
 	{
+		MemoryHelper::WriteMemory<float>(g_State.pGEngine + 0x4A4, g_State.scaleFactor, false);
+
 		if (g_State.scaleFactor > ASPECT_RATIO_16_9)
 		{
-			// Update FOV/Viewport for Ultrawide
-			MemoryHelper::WriteMemory<float>(g_State.pGEngine + 0x4A4, g_State.scaleFactor, false);
 			g_State.updateFOV = true;
-
-			float baseTan = tanf((90.0f * 0.5f) * (M_PI / 180.0f));
-			g_State.FOVScale = 2.0f * atanf((g_State.scaleFactor / ASPECT_RATIO_16_9) * baseTan) * (180.0f / M_PI);
+			g_State.FOVScale = ScaleFOV(90.0f, ASPECT_RATIO_16_9, g_State.scaleFactor);
 		}
 		else
 		{
-			// Update Viewport and leave default FOV
-			MemoryHelper::WriteMemory<float>(g_State.pGEngine + 0x4A4, g_State.scaleFactor, false);
 			g_State.updateFOV = false;
 		}
 	}
@@ -1553,7 +1555,6 @@ static void ApplyFixUltraWideScreenFOV()
 		[](safetyhook::Context& ctx)
 		{
 			static float lastFOV = 0.0f;
-			static float lastFOVCut = 0.0f;
 			uint32_t eax = ctx.eax;
 
 			if (g_State.updateFOV && g_State.pFOV != 0 && eax == g_State.pFOV)
@@ -1562,24 +1563,16 @@ static void ApplyFixUltraWideScreenFOV()
 
 				if (currentFOV != lastFOV)
 				{
-					// London FOV
-					if (currentFOV == 70.0f)
-					{
-						float scaledFOV = currentFOV * g_State.scaleFactor / ASPECT_RATIO_16_9;
-						MemoryHelper::WriteMemory<float>(g_State.pFOV, scaledFOV, false);
-						lastFOV = scaledFOV;
-					}
-					else
-					{
-						MemoryHelper::WriteMemory<float>(g_State.pFOV, g_State.FOVScale, false);
-						lastFOV = g_State.FOVScale;
-					}
+					// London uses a different base FOV
+					float scaledFOV = (currentFOV == 70.0f) ? ScaleFOV(currentFOV, ASPECT_RATIO_16_9, g_State.scaleFactor) : g_State.FOVScale;
+
+					MemoryHelper::WriteMemory<float>(g_State.pFOV, scaledFOV, false);
+					lastFOV = scaledFOV;
 				}
 			}
 
 			if (g_State.isCutscene && g_State.updateFOV && g_State.pFOVCut != 0 && eax == g_State.pFOVCut)
 			{
-				// Scale FOV with cutscene
 				MemoryHelper::WriteMemory<float>(g_State.pFOVCut, g_State.FOVScale, false);
 			}
 		}
