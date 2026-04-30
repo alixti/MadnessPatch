@@ -1665,6 +1665,12 @@ static void Init()
 {
 	ReadConfig();
 
+
+	if (FixInputBinding)
+	{
+		FixIniBindings::FixAll();
+	}
+
 	// Fixes
 	ApplyFixHighFPSHairPhysics();
 	ApplyFixHighFPSClothPhysics();
@@ -1770,8 +1776,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 			{
 				SystemHelper::LoadProxyLibrary();
 			}
-
-			FixIniBindings::FixAll();
 
 			hkCreateMutexW = HookHelper::CreateHookAPI(L"kernel32.dll", "CreateMutexW", &CreateMutexW_Hook);
 			break;
