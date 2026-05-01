@@ -86,6 +86,13 @@ The game normally loads blurry textures first and then sharpens them as you get 
 
 > **Note**: May increase VRAM usage and impact performance on systems with limited graphics memory.
 
+## Disable Background Level Streaming
+
+Disables the engine's background level streaming during gameplay, which can cause stuttering as levels are loaded in the background while playing.
+Will increase loading times.
+
+Enable with `DisableBackgroundLevelStreaming = 1` in `MadnessPatch.ini`.
+
 ## Bink Video Color Space Fix
 
 Switched the Bink video color profile from BT.601 to BT.709, which is the standard for HD video, so pre-rendered videos now show correct colors, especially deep reds and warm tones.

@@ -6,8 +6,6 @@
 
 #include <stacktrace>
 
-#include "SDK\SdkHeaders.hpp"
-
 #include "MFortress\Patches_EA.hpp"
 #include "MFortress\Patches_Steam.hpp"
 
@@ -159,6 +157,7 @@ int MaxFPS = 0;
 bool EnableMaxSmoothedFrameRate = false;
 bool ImprovedTextureStreaming = false;
 bool ForceHighResTextures = false;
+bool DisableBackgroundLevelStreaming = false;
 bool FixUltraWideScreenFOV = false;
 bool ReducedMipMapBias = false;
 bool FixBinkVideoBT709 = false;
@@ -256,6 +255,7 @@ static void ReadConfig()
 	MaxFPS = IniHelper::ReadInteger("Graphics", "MaxFPS", 120);
 	ForceHighResTextures = IniHelper::ReadInteger("Graphics", "ForceHighResTextures", 1) == 1;
 	ImprovedTextureStreaming = IniHelper::ReadInteger("Graphics", "ImprovedTextureStreaming", 1) == 1;
+	DisableBackgroundLevelStreaming = IniHelper::ReadInteger("Graphics", "DisableBackgroundLevelStreaming", 0) == 1;
 	FixUltraWideScreenFOV = IniHelper::ReadInteger("Graphics", "FixUltraWideScreenFOV", 1) == 1;
 	ReducedMipMapBias = IniHelper::ReadInteger("Graphics", "ReducedMipMapBias", 1) == 1;
 	FixBinkVideoBT709 = IniHelper::ReadInteger("Graphics", "FixBinkVideoBT709", 1) == 1;
@@ -1560,6 +1560,31 @@ static void ApplyReducedMipMapBias()
 	);
 }
 
+static void ApplyDisableBackgroundLevelStreaming()
+{
+	if (!DisableBackgroundLevelStreaming) return;
+
+	DWORD addr_BackgroundLevelStreaming = ScanModuleSignature(g_State.GameModule, "83 C4 10 8D 8D 60 FF FF FF", "BackgroundLevelStreaming");
+
+	if (addr_BackgroundLevelStreaming == 0) return;
+
+	static SafetyHookMid BackgroundLevelStreamingHook{};
+	BackgroundLevelStreamingHook = safetyhook::create_mid(addr_BackgroundLevelStreaming - 0x5,
+		[](safetyhook::Context& ctx)
+		{
+			const wchar_t* str = *(const wchar_t**)(ctx.eax);
+			if (str && (wcscmp(str, L"AliceEntryExtra") == 0 || wcscmp(str, L"AliceEntryManual") == 0))
+			{
+				*(uint32_t*)(g_State.pGEngine + 0x2A8) |= 0x100;
+			}
+			else
+			{
+				*(uint32_t*)(g_State.pGEngine + 0x2A8) &= ~0x100u;
+			}
+		}
+	);
+}
+
 static void ApplyFixBinkVideoBT709()
 {
 	if (!FixBinkVideoBT709) return;
@@ -1603,34 +1628,24 @@ static void ApplyResolutionHook()
 {
 	if (!FontScaling && !FixUltraWideScreenFOV) return;
 
-	DWORD addr_GetGEnginePtr = ScanModuleSignature(g_State.GameModule, "E8 ?? ?? ?? ?? 83 C4 40 A3 ?? ?? ?? ?? 68", "GetGEnginePtr");
 	DWORD addr_UpdateViewportRHI = ScanModuleSignature(g_State.GameModule, "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 83 EC ?? 53 56 57 A1 ?? ?? ?? ?? 33 C5 50 8D 45 F4 64 A3 00 00 00 00 8B ?? FF 15", "UpdateViewportRHI");
 
-	if (addr_GetGEnginePtr == 0 ||
-		addr_UpdateViewportRHI == 0) {
-		return;
-	}
-
-	static SafetyHookMid GetGEnginePtr{};
-	GetGEnginePtr = safetyhook::create_mid(addr_GetGEnginePtr + 0x8,
-		[](safetyhook::Context& ctx)
-		{
-			g_State.pGEngine = ctx.eax;
-		}
-	);
+	if (addr_UpdateViewportRHI == 0) return;
 
 	UpdateViewportRHI = HookHelper::CreateHook((void*)addr_UpdateViewportRHI, &UpdateViewportRHI_Hook);
 }
 
 static void ApplyGetPointerHook()
 {
-	if (!DisableMouseAcceleration && !FixUltraWideScreenFOV) return;
+	if (!DisableMouseAcceleration && !FixUltraWideScreenFOV && !DisableBackgroundLevelStreaming) return;
 
 	DWORD addr_PlayActorPtr = ScanModuleSignature(g_State.GameModule, "89 47 40 8B 45 ?? 88 5D FC 89 5D ?? 89 5D ?? 3B C3 74 0E 6A 01 50 E8 ?? ?? ?? ?? 83 C4 08 89 5D", "PlayActorPtr");
 	DWORD addr_UpdatePlayActorPtr = ScanModuleSignature(g_State.GameModule, "2C 02 00 00 ?? ?? 14 06 00 00", "UpdatePlayActorPtr");
+	DWORD addr_GetGEnginePtr = ScanModuleSignature(g_State.GameModule, "E8 ?? ?? ?? ?? 83 C4 40 A3 ?? ?? ?? ?? 68", "GetGEnginePtr");
 
 	if (addr_PlayActorPtr == 0 ||
-		addr_UpdatePlayActorPtr == 0) {
+		addr_UpdatePlayActorPtr == 0 ||
+		addr_GetGEnginePtr == 0) {
 		return;
 	}
 
@@ -1657,6 +1672,14 @@ static void ApplyGetPointerHook()
 			{
 				g_State.pFOV = esi + 0xA44;
 			}
+		}
+	);
+
+	static SafetyHookMid GetGEnginePtr{};
+	GetGEnginePtr = safetyhook::create_mid(addr_GetGEnginePtr + 0x8,
+		[](safetyhook::Context& ctx)
+		{
+			g_State.pGEngine = ctx.eax;
 		}
 	);
 }
@@ -1700,6 +1723,7 @@ static void Init()
 	ApplyFixUltraWideScreenFOV();
 	ApplyImprovedTextureStreaming();
 	ApplyReducedMipMapBias();
+	ApplyDisableBackgroundLevelStreaming();
 	ApplyFixBinkVideoBT709();
 
 	// Misc
