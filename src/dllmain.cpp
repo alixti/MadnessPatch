@@ -476,6 +476,8 @@ safetyhook::InlineHook HairSimulator;
 static void __fastcall HairSimulator_Hook(void* thisPtr, int, float delta)
 {
 	g_State.frameTimeScale = TARGET_FRAME_TIME / delta;
+	g_State.savedHairDeltaTime = delta;
+
 	HairSimulator.unsafe_thiscall<void>(thisPtr, delta);
 }
 
@@ -989,37 +991,63 @@ static void ApplyFixHighFPSHairPhysics()
 
 	HairSimulator = HookHelper::CreateHook((void*)addr_HairSimulator, &HairSimulator_Hook);
 
-	static SafetyHookMid hairDampingScaler{};
-	hairDampingScaler = safetyhook::create_mid(addr_DampingScaler,
-		[](safetyhook::Context& ctx)
-		{
-			// Scale damping factors
-			ctx.xmm3.f32[0] = ctx.xmm3.f32[0] / g_State.frameTimeScale;
-			ctx.xmm1.f32[0] = ctx.xmm1.f32[0] / g_State.frameTimeScale;
-			ctx.xmm4.f32[0] = ctx.xmm4.f32[0] / g_State.frameTimeScale;
-		}
-	);
-
 	static SafetyHookMid hairDeltaTimeOverride{};
-	hairDeltaTimeOverride = safetyhook::create_mid(addr_DeltaTimeOverride,
-		[](safetyhook::Context& ctx)
-		{
-			uint32_t ebx = ctx.ebx;
-
-			float* deltaTime = (float*)(ebx + 0x8);
-			g_State.savedHairDeltaTime = *deltaTime;
-			*deltaTime = *deltaTime * g_State.frameTimeScale;
+	hairDeltaTimeOverride = safetyhook::create_mid(0xB99352,
+		[](safetyhook::Context& ctx) {
+			float* dt = reinterpret_cast<float*>(ctx.ebx + 0x8);
+			*dt *= g_State.frameTimeScale;
 		}
 	);
 
 	static SafetyHookMid hairDeltaTimeRestore{};
-	hairDeltaTimeRestore = safetyhook::create_mid(addr_DeltaTimeOverride + 0x8,
+	hairDeltaTimeRestore = safetyhook::create_mid(0xB9935A,
+		[](safetyhook::Context& ctx) {
+			float* dt = reinterpret_cast<float*>(ctx.ebx + 0x8);
+			*dt = g_State.savedHairDeltaTime;
+		}
+	);
+
+	static SafetyHookMid hairInnerPhaseFix{};
+	hairInnerPhaseFix = safetyhook::create_mid(0xB991CD,
+		[](safetyhook::Context& ctx) {
+			float* innerDt = reinterpret_cast<float*>(ctx.ebx + 0x8);
+			*innerDt = g_State.savedHairDeltaTime;
+		}
+	);
+
+	static SafetyHookMid hairShapeMatchDecompound{};
+	hairShapeMatchDecompound = safetyhook::create_mid(0xB98E94,
+		[](safetyhook::Context& ctx) {
+			float f30 = ctx.xmm3.f32[0];
+			float scale = g_State.frameTimeScale;
+			if (!std::isfinite(f30) || !std::isfinite(scale) || scale < 1.0f) return;
+			float remain = 1.0f - f30;
+			if (remain < 0.0f) remain = 0.0f;
+			if (remain > 1.0f) remain = 1.0f;
+			float fNew = 1.0f - std::pow(remain, 1.0f / scale);
+			if (std::isfinite(fNew)) ctx.xmm3.f32[0] = fNew;
+		}
+	);
+
+	static SafetyHookMid hairWindAttenuate{};
+	hairWindAttenuate = safetyhook::create_mid(0xB98D89,
 		[](safetyhook::Context& ctx)
 		{
-			uint32_t ebx = ctx.ebx;
+			float k = 1.0f / g_State.frameTimeScale;
+			ctx.xmm6.f32[0] *= k;
+			ctx.xmm6.f32[1] *= k;
+			ctx.xmm6.f32[2] *= k;
+		}
+	);
 
-			float* deltaTime = (float*)(ebx + 0x8);
-			*deltaTime = g_State.savedHairDeltaTime;
+	static SafetyHookMid hairGravityAttenuate{};
+	hairGravityAttenuate = safetyhook::create_mid(0xB98D1B,
+		[](safetyhook::Context& ctx)
+		{
+			float k = 1.0f / g_State.frameTimeScale;
+			ctx.xmm2.f32[0] *= k;
+			ctx.xmm2.f32[1] *= k;
+			ctx.xmm2.f32[2] *= k;
 		}
 	);
 }
