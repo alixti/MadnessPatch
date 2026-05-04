@@ -258,7 +258,7 @@ static void ReadConfig()
 	MaxFPS = IniHelper::ReadInteger("Graphics", "MaxFPS", 120);
 	ForceHighResTextures = IniHelper::ReadInteger("Graphics", "ForceHighResTextures", 1) == 1;
 	ImprovedTextureStreaming = IniHelper::ReadInteger("Graphics", "ImprovedTextureStreaming", 1) == 1;
-	DisableBackgroundLevelStreaming = IniHelper::ReadInteger("Graphics", "DisableBackgroundLevelStreaming", 0) == 1;
+	DisableBackgroundLevelStreaming = IniHelper::ReadInteger("Graphics", "DisableBackgroundLevelStreaming", 1) == 1;
 	FixUltraWideScreenFOV = IniHelper::ReadInteger("Graphics", "FixUltraWideScreenFOV", 1) == 1;
 	ReducedMipMapBias = IniHelper::ReadInteger("Graphics", "ReducedMipMapBias", 1) == 1;
 	FixBinkVideoBT709 = IniHelper::ReadInteger("Graphics", "FixBinkVideoBT709", 1) == 1;

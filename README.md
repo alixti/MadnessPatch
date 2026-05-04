@@ -91,7 +91,7 @@ The game normally loads blurry textures first and then sharpens them as you get 
 Disables the engine's background level streaming during gameplay, which can cause stuttering as levels are loaded in the background while playing.
 Will increase loading times.
 
-Enable with `DisableBackgroundLevelStreaming = 1` in `MadnessPatch.ini`.
+Disable with `DisableBackgroundLevelStreaming = 0` in `MadnessPatch.ini`.
 
 ## Bink Video Color Space Fix
 
