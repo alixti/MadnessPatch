@@ -138,6 +138,9 @@
     <ClInclude Include="..\include\FixIniBindings.hpp">
       <Filter>include</Filter>
     </ClInclude>
+    <ClInclude Include="..\include\CrashHandler.hpp">
+      <Filter>include</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="MadnessPatch.ini" />

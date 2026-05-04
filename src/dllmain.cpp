@@ -3,6 +3,7 @@
 #define NOMINMAX
 
 #include <Windows.h>
+#include <shlwapi.h>
 
 #include <stacktrace>
 
@@ -13,8 +14,8 @@
 #include "dllmain.hpp"
 #include "Controller.hpp"
 #include "helper.hpp"
-#include <shlwapi.h>
 #include "FixIniBindings.hpp"
+#include "CrashHandler.hpp"
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "SDL3-static.lib")
@@ -135,6 +136,7 @@ bool CheckAlice1InstallFolder = false;
 bool SkipEAIntro = false;
 bool SkipSHIntro = false;
 bool SkipUEIntro = false;
+bool EnableCrashHandler = false;
 
 // Display
 bool FontScaling = false;
@@ -234,6 +236,7 @@ static void ReadConfig()
 	SkipEAIntro = IniHelper::ReadInteger("General", "SkipEAIntro", 0) == 1;
 	SkipSHIntro = IniHelper::ReadInteger("General", "SkipSHIntro", 1) == 1;
 	SkipUEIntro = IniHelper::ReadInteger("General", "SkipUEIntro", 1) == 1;
+	EnableCrashHandler = IniHelper::ReadInteger("General", "EnableCrashHandler", 1) == 1;
 
 	// Display
 	FontScaling = IniHelper::ReadInteger("Display", "FontScaling", 1) == 1;
@@ -1785,6 +1788,11 @@ static void Init()
 	if (FixInputBinding)
 	{
 		FixIniBindings::FixAll();
+	}
+
+	if (EnableCrashHandler)
+	{
+		CrashHandler::Install();
 	}
 
 	// Fixes
