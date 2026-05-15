@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <cwchar>
 
@@ -26,6 +27,22 @@ namespace CrashHandler
 	static GetModuleFileNameExFn g_GetModuleFileNameEx = nullptr;
 	static GetModuleInformationFn g_GetModuleInformation = nullptr;
 
+	static void WriteStr(HANDLE file, const char* text)
+	{
+		DWORD bw;
+		WriteFile(file, text, (DWORD)strlen(text), &bw, nullptr);
+	}
+
+	static void WriteFmt(HANDLE file, const char* fmt, ...)
+	{
+		char buf[2048];
+		va_list args;
+		va_start(args, fmt);
+		vsprintf_s(buf, fmt, args);
+		va_end(args);
+		WriteStr(file, buf);
+	}
+
 	static const char* FindFileNameA(const char* path)
 	{
 		const char* bs = strrchr(path, '\\');
@@ -47,6 +64,12 @@ namespace CrashHandler
 		}
 	}
 
+	static bool IsAddressInModule(DWORD_PTR addr)
+	{
+		HMODULE mod = nullptr;
+		return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &mod) && mod != nullptr;
+	}
+
 	static const char* ExceptionCodeName(DWORD code)
 	{
 		switch (code)
@@ -55,7 +78,9 @@ namespace CrashHandler
 			case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:    return "ARRAY_BOUNDS_EXCEEDED";
 			case EXCEPTION_BREAKPOINT:               return "BREAKPOINT";
 			case EXCEPTION_DATATYPE_MISALIGNMENT:    return "DATATYPE_MISALIGNMENT";
+			case EXCEPTION_FLT_DENORMAL_OPERAND:     return "FLT_DENORMAL_OPERAND";
 			case EXCEPTION_FLT_DIVIDE_BY_ZERO:       return "FLT_DIVIDE_BY_ZERO";
+			case EXCEPTION_FLT_INEXACT_RESULT:       return "FLT_INEXACT_RESULT";
 			case EXCEPTION_FLT_INVALID_OPERATION:    return "FLT_INVALID_OPERATION";
 			case EXCEPTION_FLT_OVERFLOW:             return "FLT_OVERFLOW";
 			case EXCEPTION_FLT_STACK_CHECK:          return "FLT_STACK_CHECK";
@@ -111,12 +136,81 @@ namespace CrashHandler
 		}
 	}
 
+	static void WriteRegisters(HANDLE file, CONTEXT* ctx)
+	{
+		WriteStr(file, "\r\n=== Registers ===\r\n");
+
+		WriteFmt(file,
+			"  EAX=0x%08X  EBX=0x%08X  ECX=0x%08X  EDX=0x%08X\r\n"
+			"  ESI=0x%08X  EDI=0x%08X  EBP=0x%08X  ESP=0x%08X\r\n"
+			"  EIP=0x%08X  EFLAGS=0x%08X\r\n"
+			"  CS=0x%04X  DS=0x%04X  ES=0x%04X  FS=0x%04X  GS=0x%04X  SS=0x%04X\r\n",
+			ctx->Eax, ctx->Ebx, ctx->Ecx, ctx->Edx,
+			ctx->Esi, ctx->Edi, ctx->Ebp, ctx->Esp,
+			ctx->Eip, ctx->EFlags,
+			ctx->SegCs, ctx->SegDs, ctx->SegEs, ctx->SegFs, ctx->SegGs, ctx->SegSs);
+
+		if (ctx->ContextFlags & CONTEXT_DEBUG_REGISTERS)
+		{
+			WriteStr(file, "\r\n=== Debug Registers ===\r\n");
+			WriteFmt(file,
+				"  DR0=0x%08X  DR1=0x%08X  DR2=0x%08X  DR3=0x%08X\r\n"
+				"  DR6=0x%08X  DR7=0x%08X\r\n",
+				ctx->Dr0, ctx->Dr1, ctx->Dr2, ctx->Dr3,
+				ctx->Dr6, ctx->Dr7);
+		}
+
+		if (ctx->ContextFlags & CONTEXT_FLOATING_POINT)
+		{
+			WriteStr(file, "\r\n=== x87 FPU ===\r\n");
+			WriteFmt(file,
+				"  ControlWord=0x%04X  StatusWord=0x%04X  TagWord=0x%04X\r\n"
+				"  ErrorOffset=0x%08X  ErrorSelector=0x%08X\r\n"
+				"  DataOffset=0x%08X   DataSelector=0x%08X\r\n",
+				ctx->FloatSave.ControlWord & 0xFFFF, ctx->FloatSave.StatusWord & 0xFFFF, ctx->FloatSave.TagWord & 0xFFFF,
+				ctx->FloatSave.ErrorOffset, ctx->FloatSave.ErrorSelector,
+				ctx->FloatSave.DataOffset, ctx->FloatSave.DataSelector);
+
+			for (int i = 0; i < 8; i++)
+			{
+				const BYTE* st = &ctx->FloatSave.RegisterArea[i * 10];
+				WriteFmt(file,
+					"  ST%d = %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+					i, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9]);
+			}
+		}
+
+		if (ctx->ContextFlags & CONTEXT_EXTENDED_REGISTERS)
+		{
+			WriteStr(file, "\r\n=== SSE / XMM ===\r\n");
+
+			DWORD mxcsr = *(DWORD*)&ctx->ExtendedRegisters[24];
+			WriteFmt(file, "  MXCSR=0x%08X\r\n", mxcsr);
+
+			for (int i = 0; i < 8; i++)
+			{
+				const BYTE* xmm = &ctx->ExtendedRegisters[160 + i * 16];
+				DWORD d0 = *(DWORD*)&xmm[0];
+				DWORD d1 = *(DWORD*)&xmm[4];
+				DWORD d2 = *(DWORD*)&xmm[8];
+				DWORD d3 = *(DWORD*)&xmm[12];
+				float f0 = *(float*)&d0;
+				float f1 = *(float*)&d1;
+				float f2 = *(float*)&d2;
+				float f3 = *(float*)&d3;
+				WriteFmt(file,
+					"  XMM%d = %08X %08X %08X %08X   [ %g %g %g %g ]\r\n",
+					i, d0, d1, d2, d3, f0, f1, f2, f3);
+			}
+		}
+	}
+
 	static void WriteStackTrace(HANDLE file, CONTEXT* ctx)
 	{
 		HANDLE process = GetCurrentProcess();
 		HANDLE thread = GetCurrentThread();
 
-		SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+		SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_NO_PROMPTS | SYMOPT_FAIL_CRITICAL_ERRORS);
 		SymInitialize(process, nullptr, TRUE);
 
 		STACKFRAME64 frame{};
@@ -127,15 +221,24 @@ namespace CrashHandler
 		frame.AddrStack.Offset = ctx->Esp;
 		frame.AddrStack.Mode = AddrModeFlat;
 
-		char line[1024];
 		int frameNum = 0;
-		DWORD bytesWritten;
+		int totalWalked = 0;
 
 		while (StackWalk64(IMAGE_FILE_MACHINE_I386, process, thread, &frame, ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
 		{
 			if (frame.AddrPC.Offset == 0)
 			{
 				break;
+			}
+
+			if (++totalWalked > 128)
+			{
+				break;
+			}
+
+			if (!IsAddressInModule((DWORD_PTR)frame.AddrPC.Offset))
+			{
+				continue;
 			}
 
 			char addrStr[256];
@@ -147,6 +250,7 @@ namespace CrashHandler
 			sym->MaxNameLen = 255;
 			DWORD64 displacement = 0;
 
+			char line[1024];
 			if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, sym))
 			{
 				sprintf_s(line, "  #%02d  %s   %s+0x%llx\r\n", frameNum, addrStr, sym->Name, displacement);
@@ -156,7 +260,7 @@ namespace CrashHandler
 				sprintf_s(line, "  #%02d  %s\r\n", frameNum, addrStr);
 			}
 
-			WriteFile(file, line, (DWORD)strlen(line), &bytesWritten, nullptr);
+			WriteStr(file, line);
 			frameNum++;
 
 			if (frameNum > 64)
@@ -170,9 +274,7 @@ namespace CrashHandler
 
 	static void WriteModuleList(HANDLE file)
 	{
-		const char* hdr = "\r\n=== Loaded Modules ===\r\n";
-		DWORD bw;
-		WriteFile(file, hdr, (DWORD)strlen(hdr), &bw, nullptr);
+		WriteStr(file, "\r\n=== Loaded Modules ===\r\n");
 
 		if (!g_EnumProcessModules || !g_GetModuleFileNameEx || !g_GetModuleInformation)
 		{
@@ -199,11 +301,10 @@ namespace CrashHandler
 			MODULEINFO mi{};
 			g_GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi));
 
-			char line[MAX_PATH + 64];
-			sprintf_s(line, "  0x%08X - 0x%08X  %s\r\n", (unsigned)(DWORD_PTR)mi.lpBaseOfDll, (unsigned)((DWORD_PTR)mi.lpBaseOfDll + mi.SizeOfImage), path);
-
-			DWORD w;
-			WriteFile(file, line, (DWORD)strlen(line), &w, nullptr);
+			WriteFmt(file, "  0x%08X - 0x%08X  %s\r\n",
+				(unsigned)(DWORD_PTR)mi.lpBaseOfDll,
+				(unsigned)((DWORD_PTR)mi.lpBaseOfDll + mi.SizeOfImage),
+				path);
 		}
 	}
 
@@ -234,15 +335,13 @@ namespace CrashHandler
 			return;
 		}
 
-		DWORD bw;
 		EXCEPTION_RECORD* er = ep->ExceptionRecord;
 		CONTEXT* ctx = ep->ContextRecord;
 
 		char addrStr[256];
 		FormatAddress((DWORD_PTR)er->ExceptionAddress, addrStr, sizeof(addrStr));
 
-		char tmp[2048];
-		sprintf_s(tmp,
+		WriteFmt(file,
 			"=== Crash Report ===\r\n"
 			"Source:     %s\r\n"
 			"Time:       %04d-%02d-%02d %02d:%02d:%02d\r\n"
@@ -255,30 +354,21 @@ namespace CrashHandler
 			ExceptionCodeName(er->ExceptionCode),
 			addrStr,
 			GetCurrentThreadId());
-		WriteFile(file, tmp, (DWORD)strlen(tmp), &bw, nullptr);
 
 		if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
 		{
-			const char* op = er->ExceptionInformation[0] == 0 ? "read" : er->ExceptionInformation[0] == 1 ? "write" : "execute";
-			sprintf_s(tmp, "AV Detail:  %s at 0x%08X\r\n", op, (unsigned)er->ExceptionInformation[1]);
-			WriteFile(file, tmp, (DWORD)strlen(tmp), &bw, nullptr);
+			const char* op = er->ExceptionInformation[0] == 0 ? "read" : er->ExceptionInformation[0] == 1 ? "write" : er->ExceptionInformation[0] == 8 ? "DEP" : "execute";
+			WriteFmt(file, "AV Detail:  %s at 0x%08X\r\n", op, (unsigned)er->ExceptionInformation[1]);
 		}
 
-		sprintf_s(tmp,
-			"\r\n=== Registers ===\r\n"
-			"  EIP=0x%08X  EFLAGS=0x%08X\r\n"
-			"  EAX=0x%08X  EBX=0x%08X  ECX=0x%08X  EDX=0x%08X\r\n"
-			"  ESI=0x%08X  EDI=0x%08X  EBP=0x%08X  ESP=0x%08X\r\n"
-			"  CS=0x%04X  DS=0x%04X  ES=0x%04X  FS=0x%04X  GS=0x%04X  SS=0x%04X\r\n",
-			ctx->Eip, ctx->EFlags,
-			ctx->Eax, ctx->Ebx, ctx->Ecx, ctx->Edx,
-			ctx->Esi, ctx->Edi, ctx->Ebp, ctx->Esp,
-			ctx->SegCs, ctx->SegDs, ctx->SegEs, ctx->SegFs, ctx->SegGs, ctx->SegSs);
-		WriteFile(file, tmp, (DWORD)strlen(tmp), &bw, nullptr);
+		if (er->ExceptionCode == EXCEPTION_IN_PAGE_ERROR && er->NumberParameters >= 3)
+		{
+			WriteFmt(file, "NTSTATUS:   0x%08X\r\n", (unsigned)er->ExceptionInformation[2]);
+		}
 
-		const char* stHdr = "\r\n=== Stack Trace ===\r\n";
-		WriteFile(file, stHdr, (DWORD)strlen(stHdr), &bw, nullptr);
+		WriteRegisters(file, ctx);
 
+		WriteStr(file, "\r\n=== Stack Trace ===\r\n");
 		CONTEXT ctxCopy = *ctx;
 		WriteStackTrace(file, &ctxCopy);
 
@@ -353,6 +443,9 @@ namespace CrashHandler
 	static void Install(bool useVEH = true)
 	{
 		SetErrorMode(SEM_NOGPFAULTERRORBOX);
+
+		ULONG stackReserve = 64 * 1024;
+		SetThreadStackGuarantee(&stackReserve);
 
 		g_psapi = LoadLibraryA("psapi.dll");
 		if (g_psapi)
