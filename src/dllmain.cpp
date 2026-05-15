@@ -124,6 +124,9 @@ bool FixHighFPSClothPhysics = false;
 bool FixHighFPSProjectileCollisionCheck = false;
 bool FixHighFPSRagdollDeath = false;
 bool FixHashTableRaceCondition = false;
+bool FixUnattachedCollisionPanic = false;
+bool FixHairCurveOverRead = false;
+bool FixExperimental = false;
 bool FixPhysX = false;
 bool FixInputBinding = false;
 bool FixWindowHandling = false;
@@ -224,11 +227,14 @@ static void ReadConfig()
 	FixHighFPSProjectileCollisionCheck = IniHelper::ReadInteger("Fixes", "FixHighFPSProjectileCollisionCheck", 1) == 1;
 	FixHighFPSRagdollDeath = IniHelper::ReadInteger("Fixes", "FixHighFPSRagdollDeath", 1) == 1;
 	FixHashTableRaceCondition = IniHelper::ReadInteger("Fixes", "FixHashTableRaceCondition", 1) == 1;
+	FixUnattachedCollisionPanic = IniHelper::ReadInteger("Fixes", "FixUnattachedCollisionPanic", 1) == 1;
+	FixHairCurveOverRead = IniHelper::ReadInteger("Fixes", "FixHairCurveOverRead", 1) == 1;
+	FixExperimental = IniHelper::ReadInteger("Fixes", "FixExperimental", 1) == 1;
 	FixPhysX = IniHelper::ReadInteger("Fixes", "FixPhysX", 1) == 1;
 	FixInputBinding = IniHelper::ReadInteger("Fixes", "FixInputBinding", 1) == 1;
 	FixWindowHandling = IniHelper::ReadInteger("Fixes", "FixWindowHandling", 1) == 1;
 	MaxProcessorCount = IniHelper::ReadInteger("Fixes", "MaxProcessorCount", 2);
-
+	
 	// General
 	UnlockCompleteEditionDLC = IniHelper::ReadInteger("General", "UnlockCompleteEditionDLC", 1) == 1;
 	DisableLegacyDriverHacks = IniHelper::ReadInteger("General", "DisableLegacyDriverHacks", 1) == 1;
@@ -549,6 +555,31 @@ static double __fastcall GetMaxTickRate_Hook(int thisp, int, float a2, int a3)
 	}
 
 	return GetMaxTickRate.unsafe_thiscall<double>(thisp, a2, a3);
+}
+
+// ======================
+// FixExperimental
+// ======================
+
+static safetyhook::InlineHook SetObjectReference{};
+static safetyhook::InlineHook IteratorNotEqualHook{};
+
+static int __fastcall SetObjectReference_Hook(DWORD* thisp, int, int a2)
+{
+	if (!thisp)
+		return 0;
+
+	return SetObjectReference.unsafe_thiscall<int>(thisp, a2);
+}
+
+static bool __fastcall IteratorNotEqual_Hook(DWORD* thisp, int, DWORD* other)
+{
+	const uint32_t current = *thisp;
+
+	if (current == 1)
+		return false;
+
+	return current != *other;
 }
 
 // ======================
@@ -1197,6 +1228,67 @@ static void ApplyFixHashTableRaceCondition()
 	MemoryHelper::MakeNOP(addr_hashLoop + 0x10, 2);
 }
 
+static void ApplyFixUnattachedCollisionPanic()
+{
+	if (!FixUnattachedCollisionPanic) return;
+
+	DWORD addr_FixUnattachedCollisionPanic = ScanModuleSignature(g_State.GameModule, "0F 85 93 00 00 00 8D 85 10 FF FF FF 50 E8", "FixUnattachedCollisionPanic");
+
+	if (addr_FixUnattachedCollisionPanic == 0) return;
+
+	static uintptr_t s_unattached_collision_skip = 0;
+	s_unattached_collision_skip = addr_FixUnattachedCollisionPanic + 0x1B0B;
+
+	static SafetyHookMid UnattachedCollisionGuard{};
+	UnattachedCollisionGuard = safetyhook::create_mid(addr_FixUnattachedCollisionPanic + 0x6,
+		[](safetyhook::Context& ctx)
+		{
+			*reinterpret_cast<uint32_t*>(ctx.esi + 0x3C) |= 0x80;
+			ctx.eax = 0;
+			ctx.eip = s_unattached_collision_skip;
+		});
+}
+
+static void ApplyFixHairCurveOverRead()
+{
+	if (!FixHairCurveOverRead) return;
+
+	DWORD addr_FixHairCurveOverRead = ScanModuleSignature(g_State.GameModule, "74 0E 83 C1 50 3B CE 8B 4D E0 74 04", "FixHairCurveOverRead");
+
+	if (addr_FixHairCurveOverRead == 0) return;
+
+	MemoryHelper::WriteMemory<uint8_t>(addr_FixHairCurveOverRead, 0x73);
+}
+
+static void ApplyFixExperimental()
+{
+	if (!FixExperimental) return;
+
+	DWORD addr_MmxOverRead = ScanModuleSignature(g_State.GameModule, "83 EC 10 0F 28 0D ?? ?? ?? ?? 8B 43 08 0F EF C0 0F 6F 09", "MmxOverRead");
+	DWORD addr_SetObjectReference = ScanModuleSignature(g_State.GameModule, "55 8B EC 83 EC 44 89 4D BC C6 45 FF 00 8B 45 BC", "SetObjectReference");
+	DWORD addr_IteratorNotEqual = ScanModuleSignature(g_State.GameModule, "55 8B EC 51 89 4D FC 8B 45 FC 8B 4D 08 8B 10", "IteratorNotEqual");
+	DWORD addr_ListWalkSentinel = ScanModuleSignature(g_State.GameModule, "3B C3 74 06 8B C8 3B CB 75 F3 F6 81 DC 00 00 00 04", "ListWalkSentinel");
+
+	if (addr_MmxOverRead == 0 ||
+		addr_SetObjectReference == 0 ||
+		addr_IteratorNotEqual == 0 ||
+		addr_ListWalkSentinel == 0) {
+		return;
+	}
+
+	MemoryHelper::WriteMemory<uint8_t>(addr_MmxOverRead + 0x11, 0x6E);
+	SetObjectReference = HookHelper::CreateHook((void*)addr_SetObjectReference, &SetObjectReference_Hook);
+	IteratorNotEqualHook = HookHelper::CreateHook((void*)addr_IteratorNotEqual, &IteratorNotEqual_Hook);
+
+	static SafetyHookMid ListWalkSentinelGuard{};
+	ListWalkSentinelGuard = safetyhook::create_mid((void*)(addr_ListWalkSentinel),
+		[](safetyhook::Context& ctx)
+		{
+			if (ctx.eax == 1)
+				ctx.eax = 0;
+		});
+}
+
 static void ApplyFixPhysX()
 {
 	if (!FixPhysX) return;
@@ -1801,6 +1893,9 @@ static void Init()
 	ApplyFixHighFPSProjectileCollisionCheck();
 	ApplyFixHighFPSRagdollDeath();
 	ApplyFixHashTableRaceCondition();
+	ApplyFixUnattachedCollisionPanic();
+	ApplyFixHairCurveOverRead();
+	ApplyFixExperimental();
 	ApplyFixPhysX();
 	ApplyFixInputBinding();
 	ApplyFixWindowHandling();
