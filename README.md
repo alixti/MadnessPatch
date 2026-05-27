@@ -176,7 +176,7 @@ Set `MaxFPS` in `MadnessPatch.ini` (0 = disable, recommended maximum: 120).
 ## Complete Edition DLC Unlock
 
 Unlocks all Complete Edition costumes, weapons, and adds a menu option to launch the original Alice game without editing the game's files.
-> **Note**: While weapons are showing up, they are not functional. See: https://github.com/Wemino/MadnessPatch/issues/9
+> **Note**: While weapons are showing up, they are not functional. See: [AESylum](https://github.com/Wemino/AESylum)
 
 ## Improved Window Management
 
