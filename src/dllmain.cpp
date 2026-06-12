@@ -20,6 +20,16 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "SDL3-static.lib")
 
+struct ClothInstanceState
+{
+	float accumulator = 0.0f;
+	bool primed = false;
+	std::vector<float> trueP1;
+	std::vector<float> relPrev;
+	std::vector<float> relCurr;
+	std::vector<float> applied;
+};
+
 struct GlobalState
 {
 	// System initialization
@@ -34,8 +44,8 @@ struct GlobalState
 
 	// Physics
 	float frameTimeScale = 0.0f;
-	float savedClothDeltaTime = 0.0f;
 	float savedHairDeltaTime = 0.0f;
+	std::unordered_map<uintptr_t, ClothInstanceState> clothes;
 
 	// FOV
 	DWORD pFOV = 0;
@@ -490,6 +500,113 @@ static void __fastcall HairSimulator_Hook(void* thisPtr, int, float delta)
 	HairSimulator.unsafe_thiscall<void>(thisPtr, delta);
 }
 
+// ==========================
+// FixHighFPSClothPhysics
+// ==========================
+
+safetyhook::InlineHook ClothSimulator;
+
+static uint32_t __fastcall ClothSimulator_Hook(void* thisPtr, int, float delta)
+{
+	uint8_t* cloth = (uint8_t*)thisPtr;
+	int numParticles = *(int*)(cloth + 0xB8);
+	uint8_t* particles = *(uint8_t**)(cloth + 0xC4);
+
+	if (!particles || numParticles <= 0)
+		return ClothSimulator.unsafe_thiscall<uint32_t>(thisPtr, delta);
+
+	ClothInstanceState& state = g_State.clothes[(uintptr_t)cloth];
+	if ((int)state.trueP1.size() != numParticles * 3)
+	{
+		state.trueP1.assign(numParticles * 3, 0.0f);
+		state.relPrev.assign(numParticles * 3, 0.0f);
+		state.relCurr.assign(numParticles * 3, 0.0f);
+		state.applied.assign(numParticles * 3, 0.0f);
+		state.primed = false;
+	}
+
+	// Restore the simulation-true p1. 
+	// If the engine rewrote p1 since we set it (teleport reset, instance respawn), adopt its value and resync instead
+	if (state.primed)
+	{
+		for (int i = 0; i < numParticles; i++)
+		{
+			float* p1 = (float*)(particles + i * 0x70 + 0x10);
+			float* p3 = (float*)(particles + i * 0x70 + 0x30);
+
+			for (int j = 0; j < 3; j++)
+			{
+				int k = i * 3 + j;
+				if (p1[j] == state.applied[k])
+				{
+					p1[j] = state.trueP1[k];
+				}
+				else
+				{
+					state.trueP1[k] = p1[j];
+					state.relCurr[k] = p1[j] - p3[j];
+					state.relPrev[k] = state.relCurr[k];
+				}
+			}
+		}
+	}
+
+	state.accumulator += delta;
+
+	if (!state.primed)
+		state.accumulator = TARGET_FRAME_TIME; // first sight of this instance: tick now
+
+	uint32_t result = 0;
+	if (state.accumulator >= TARGET_FRAME_TIME)
+	{
+		state.relPrev = state.relCurr;
+		result = ClothSimulator.unsafe_thiscall<uint32_t>(thisPtr, TARGET_FRAME_TIME);
+		state.accumulator -= TARGET_FRAME_TIME;
+
+		// Capture the post-tick anchor-relative state
+		for (int i = 0; i < numParticles; i++)
+		{
+			float* p1 = (float*)(particles + i * 0x70 + 0x10);
+			float* p3 = (float*)(particles + i * 0x70 + 0x30);
+
+			for (int j = 0; j < 3; j++)
+			{
+				state.relCurr[i * 3 + j] = p1[j] - p3[j];
+			}
+		}
+
+		if (!state.primed)
+		{
+			state.relPrev = state.relCurr;
+			state.primed = true;
+		}
+	}
+
+	// Write the render state: live anchor + interpolated relative motion
+	float alpha = state.accumulator / TARGET_FRAME_TIME;
+	const float* matrix = (const float*)cloth;
+
+	for (int i = 0; i < numParticles; i++)
+	{
+		uint8_t* particle = particles + i * 0x70;
+		float* p1 = (float*)(particle + 0x10);
+		const float* localAnchor = (const float*)(particle + 0x20);
+
+		for (int j = 0; j < 3; j++)
+		{
+			// anchor = p2.x * M0 + p2.y * M1 + p2.z * M2 + M3
+			float anchor = localAnchor[0] * matrix[j] + localAnchor[1] * matrix[4 + j] + localAnchor[2] * matrix[8 + j] + matrix[12 + j];
+
+			int k = i * 3 + j;
+			state.trueP1[k] = p1[j];
+			p1[j] = anchor + state.relPrev[k] + (state.relCurr[k] - state.relPrev[k]) * alpha;
+			state.applied[k] = p1[j];
+		}
+	}
+
+	return result;
+}
+
 // ======================================
 // FixHighFPSProjectileCollisionCheck
 // ======================================
@@ -661,16 +778,6 @@ static int __cdecl PhysXLoad_Hook()
 	}
 
 	return result;
-}
-
-safetyhook::InlineHook PhysXRelease;
-
-static int __cdecl PhysXRelease_Hook()
-{
-	(void)physxCrashFix1.disable();
-	(void)physxCrashFix2.disable();
-
-	return PhysXRelease.ccall<int>();
 }
 
 // ======================
@@ -1153,35 +1260,11 @@ static void ApplyFixHighFPSClothPhysics()
 {
 	if (!FixHighFPSClothPhysics) return;
 
-	DWORD addr_ClothSimulator = ScanModuleSignature(g_State.GameModule, "F3 0F 10 4A 20 D9 43 08 F3 0F 10 52 28", "ClothSimulator_DeltaTimeOverride");
+	DWORD addr_ClothSimulator = ScanModuleSignature(g_State.GameModule, "53 8B DC 51 83 E4 F0 83 C4 04 55 8B EC 81 EC D8 00 00 00 F3 0F 10 4B 08 8B D1", "ClothSimulator");
 
 	if (addr_ClothSimulator == 0) return;
 
-	static SafetyHookMid clothDeltaTimeOverride{};
-	clothDeltaTimeOverride = safetyhook::create_mid(addr_ClothSimulator,
-		[](safetyhook::Context& ctx)
-		{
-			uint32_t ebx = ctx.ebx;
-			uint32_t edx = ctx.edx;
-
-			float* deltaTime = (float*)(ebx + 0x8);
-			g_State.savedClothDeltaTime = *deltaTime;
-
-			if (*(float*)(edx + 0xAC) != 32.0f) // skip london dress
-				*deltaTime = TARGET_FRAME_TIME;
-		}
-	);
-
-	static SafetyHookMid clothDeltaTimeRestore{};
-	clothDeltaTimeRestore = safetyhook::create_mid(addr_ClothSimulator + 0x14,
-		[](safetyhook::Context& ctx)
-		{
-			uint32_t ebx = ctx.ebx;
-
-			float* deltaTime = (float*)(ebx + 0x8);
-			*deltaTime = g_State.savedClothDeltaTime;
-		}
-	);
+	ClothSimulator = HookHelper::CreateHook((void*)addr_ClothSimulator, &ClothSimulator_Hook);
 }
 
 static void ApplyFixHighFPSProjectileCollisionCheck()
@@ -1294,15 +1377,12 @@ static void ApplyFixPhysX()
 	if (!FixPhysX) return;
 
 	DWORD addr_PhysXLoad = ScanModuleSignature(g_State.GameModule, "55 8B EC 83 EC ?? 53 56 57 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? 6A 08 6A 04", "PhysXLoad");
-	DWORD addr_PhysXRelease = ScanModuleSignature(g_State.GameModule, "85 C0 74 14 50 E8 ?? ?? ?? ?? A1", "PhysXRelease", 2);
 
-	if (addr_PhysXLoad == 0 ||
-		addr_PhysXRelease == 0) {
+	if (addr_PhysXLoad == 0) {
 		return;
 	}
 
 	PhysXLoad = HookHelper::CreateHook((void*)addr_PhysXLoad, &PhysXLoad_Hook);
-	PhysXRelease = HookHelper::CreateHook((void*)addr_PhysXRelease, &PhysXRelease_Hook);
 }
 
 static void ApplyFixInputBinding()
