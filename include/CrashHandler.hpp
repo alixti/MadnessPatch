@@ -4,28 +4,43 @@
 #include <cstdarg>
 #include <cstring>
 #include <cwchar>
+#include <cstdlib>
+#include <csignal>
+#include <exception>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <DbgHelp.h>
-#include <Psapi.h>
 
 #pragma comment(lib, "Dbghelp.lib")
 
 namespace CrashHandler
 {
-	typedef BOOL(WINAPI* EnumProcessModulesFn)(HANDLE, HMODULE*, DWORD, LPDWORD);
-	typedef DWORD(WINAPI* GetModuleFileNameExFn)(HANDLE, HMODULE, LPSTR, DWORD);
-	typedef BOOL(WINAPI* GetModuleInformationFn)(HANDLE, HMODULE, LPMODULEINFO, DWORD);
+	struct ModuleEntry
+	{
+		DWORD_PTR base;
+		DWORD size;
+		char name[64];
+	};
+
+	static const DWORD CODE_CRT_INVALID_PARAMETER = 0xE0000001;
+	static const DWORD CODE_CRT_PURECALL = 0xE0000002;
+	static const DWORD CODE_CRT_TERMINATE = 0xE0000003;
+	static const DWORD CODE_CRT_ABORT = 0xE0000004;
 
 	static LPTOP_LEVEL_EXCEPTION_FILTER g_previousFilter = nullptr;
 	static PVOID g_vectoredHandler = nullptr;
 	static volatile LONG g_reportWritten = 0;
+	static bool g_terminateOnCrash = false;
 
-	static HMODULE g_psapi = nullptr;
-	static EnumProcessModulesFn g_EnumProcessModules = nullptr;
-	static GetModuleFileNameExFn g_GetModuleFileNameEx = nullptr;
-	static GetModuleInformationFn g_GetModuleInformation = nullptr;
+	static EXCEPTION_POINTERS* g_crashEp = nullptr;
+	static const char* g_crashTag = nullptr;
+	static DWORD g_crashThreadId = 0;
+	static volatile DWORD g_writerThreadId = 0;
+	static DWORD_PTR g_crashStackBase = 0;
+
+	static ModuleEntry g_modules[512];
+	static int g_moduleCount = 0;
 
 	static void WriteStr(HANDLE file, const char* text)
 	{
@@ -35,10 +50,10 @@ namespace CrashHandler
 
 	static void WriteFmt(HANDLE file, const char* fmt, ...)
 	{
-		char buf[2048];
+		static char buf[2048];
 		va_list args;
 		va_start(args, fmt);
-		vsprintf_s(buf, fmt, args);
+		_vsnprintf_s(buf, _countof(buf), _TRUNCATE, fmt, args);
 		va_end(args);
 		WriteStr(file, buf);
 	}
@@ -66,8 +81,76 @@ namespace CrashHandler
 
 	static bool IsAddressInModule(DWORD_PTR addr)
 	{
-		HMODULE mod = nullptr;
-		return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &mod) && mod != nullptr;
+		for (int i = 0; i < g_moduleCount; i++)
+		{
+			if (addr >= g_modules[i].base && addr < g_modules[i].base + g_modules[i].size)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	static bool IsPrecededByCall(DWORD_PTR addr)
+	{
+		const BYTE* p = (const BYTE*)addr;
+
+		if (p[-5] == 0xE8)
+		{
+			return true;
+		}
+
+		if (p[-2] == 0xFF)
+		{
+			BYTE modrm = p[-1];
+			if ((modrm & 0xF8) == 0xD0)
+			{
+				return true;
+			}
+			if ((modrm & 0xF8) == 0x10 && modrm != 0x14 && modrm != 0x15)
+			{
+				return true;
+			}
+		}
+
+		if (p[-3] == 0xFF)
+		{
+			BYTE modrm = p[-2];
+			if (modrm == 0x14)
+			{
+				return true;
+			}
+			if ((modrm & 0xF8) == 0x50 && modrm != 0x54)
+			{
+				return true;
+			}
+		}
+
+		if (p[-4] == 0xFF && p[-3] == 0x54)
+		{
+			return true;
+		}
+
+		if (p[-6] == 0xFF)
+		{
+			BYTE modrm = p[-5];
+			if (modrm == 0x15)
+			{
+				return true;
+			}
+			if ((modrm & 0xF8) == 0x90 && modrm != 0x94)
+			{
+				return true;
+			}
+		}
+
+		if (p[-7] == 0xFF && p[-6] == 0x94)
+		{
+			return true;
+		}
+
+		return false;
 	}
 
 	static const char* ExceptionCodeName(DWORD code)
@@ -95,6 +178,10 @@ namespace CrashHandler
 			case EXCEPTION_SINGLE_STEP:              return "SINGLE_STEP";
 			case EXCEPTION_STACK_OVERFLOW:           return "STACK_OVERFLOW";
 			case 0xE06D7363:                         return "CPP_EXCEPTION";
+			case CODE_CRT_INVALID_PARAMETER:         return "CRT_INVALID_PARAMETER";
+			case CODE_CRT_PURECALL:                  return "PURE_VIRTUAL_CALL";
+			case CODE_CRT_TERMINATE:                 return "CPP_TERMINATE";
+			case CODE_CRT_ABORT:                     return "ABORT";
 			default:                                 return "UNKNOWN";
 		}
 	}
@@ -113,6 +200,10 @@ namespace CrashHandler
 			case EXCEPTION_DATATYPE_MISALIGNMENT:
 			case EXCEPTION_NONCONTINUABLE_EXCEPTION:
 			case EXCEPTION_INVALID_DISPOSITION:
+			case CODE_CRT_INVALID_PARAMETER:
+			case CODE_CRT_PURECALL:
+			case CODE_CRT_TERMINATE:
+			case CODE_CRT_ABORT:
 			return true;
 		default:
 			return false;
@@ -121,19 +212,17 @@ namespace CrashHandler
 
 	static void FormatAddress(DWORD_PTR addr, char* out, size_t outSize)
 	{
-		HMODULE mod = nullptr;
-		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &mod) && mod)
+		for (int i = 0; i < g_moduleCount; i++)
 		{
-			char modPath[MAX_PATH];
-			GetModuleFileNameA(mod, modPath, MAX_PATH);
-			const char* name = FindFileNameA(modPath);
-			DWORD_PTR offset = addr - (DWORD_PTR)mod;
-			sprintf_s(out, outSize, "%s+0x%X (0x%08X)", name, (unsigned)offset, (unsigned)addr);
+			if (addr >= g_modules[i].base && addr < g_modules[i].base + g_modules[i].size)
+			{
+				DWORD_PTR offset = addr - g_modules[i].base;
+				_snprintf_s(out, outSize, _TRUNCATE, "%s+0x%X (0x%08X)", g_modules[i].name, (unsigned)offset, (unsigned)addr);
+				return;
+			}
 		}
-		else
-		{
-			sprintf_s(out, outSize, "0x%08X", (unsigned)addr);
-		}
+
+		_snprintf_s(out, outSize, _TRUNCATE, "0x%08X", (unsigned)addr);
 	}
 
 	static void WriteRegisters(HANDLE file, CONTEXT* ctx)
@@ -160,48 +249,152 @@ namespace CrashHandler
 				ctx->Dr6, ctx->Dr7);
 		}
 
-		if (ctx->ContextFlags & CONTEXT_FLOATING_POINT)
+		__try
 		{
-			WriteStr(file, "\r\n=== x87 FPU ===\r\n");
-			WriteFmt(file,
-				"  ControlWord=0x%04X  StatusWord=0x%04X  TagWord=0x%04X\r\n"
-				"  ErrorOffset=0x%08X  ErrorSelector=0x%08X\r\n"
-				"  DataOffset=0x%08X   DataSelector=0x%08X\r\n",
-				ctx->FloatSave.ControlWord & 0xFFFF, ctx->FloatSave.StatusWord & 0xFFFF, ctx->FloatSave.TagWord & 0xFFFF,
-				ctx->FloatSave.ErrorOffset, ctx->FloatSave.ErrorSelector,
-				ctx->FloatSave.DataOffset, ctx->FloatSave.DataSelector);
-
-			for (int i = 0; i < 8; i++)
+			if (ctx->ContextFlags & CONTEXT_FLOATING_POINT)
 			{
-				const BYTE* st = &ctx->FloatSave.RegisterArea[i * 10];
+				WriteStr(file, "\r\n=== x87 FPU ===\r\n");
 				WriteFmt(file,
-					"  ST%d = %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-					i, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9]);
+					"  ControlWord=0x%04X  StatusWord=0x%04X  TagWord=0x%04X\r\n"
+					"  ErrorOffset=0x%08X  ErrorSelector=0x%08X\r\n"
+					"  DataOffset=0x%08X   DataSelector=0x%08X\r\n",
+					ctx->FloatSave.ControlWord & 0xFFFF, ctx->FloatSave.StatusWord & 0xFFFF, ctx->FloatSave.TagWord & 0xFFFF,
+					ctx->FloatSave.ErrorOffset, ctx->FloatSave.ErrorSelector,
+					ctx->FloatSave.DataOffset, ctx->FloatSave.DataSelector);
+
+				for (int i = 0; i < 8; i++)
+				{
+					const BYTE* st = &ctx->FloatSave.RegisterArea[i * 10];
+					WriteFmt(file,
+						"  ST%d = %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+						i, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9]);
+				}
+			}
+
+			if (ctx->ContextFlags & CONTEXT_EXTENDED_REGISTERS)
+			{
+				WriteStr(file, "\r\n=== SSE / XMM ===\r\n");
+
+				DWORD mxcsr = *(DWORD*)&ctx->ExtendedRegisters[24];
+				WriteFmt(file, "  MXCSR=0x%08X\r\n", mxcsr);
+
+				for (int i = 0; i < 8; i++)
+				{
+					const BYTE* xmm = &ctx->ExtendedRegisters[160 + i * 16];
+					DWORD d0 = *(DWORD*)&xmm[0];
+					DWORD d1 = *(DWORD*)&xmm[4];
+					DWORD d2 = *(DWORD*)&xmm[8];
+					DWORD d3 = *(DWORD*)&xmm[12];
+					float f0 = *(float*)&d0;
+					float f1 = *(float*)&d1;
+					float f2 = *(float*)&d2;
+					float f3 = *(float*)&d3;
+					WriteFmt(file,
+						"  XMM%d = %08X %08X %08X %08X   [ %g %g %g %g ]\r\n",
+						i, d0, d1, d2, d3, f0, f1, f2, f3);
+				}
 			}
 		}
-
-		if (ctx->ContextFlags & CONTEXT_EXTENDED_REGISTERS)
+		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
-			WriteStr(file, "\r\n=== SSE / XMM ===\r\n");
+		}
+	}
 
-			DWORD mxcsr = *(DWORD*)&ctx->ExtendedRegisters[24];
-			WriteFmt(file, "  MXCSR=0x%08X\r\n", mxcsr);
+	static void WriteModuleList(HANDLE file)
+	{
+		WriteStr(file, "\r\n=== Loaded Modules ===\r\n");
 
-			for (int i = 0; i < 8; i++)
+		g_moduleCount = 0;
+
+		__try
+		{
+			BYTE* peb = (BYTE*)__readfsdword(0x30);
+			BYTE* ldr = *(BYTE**)(peb + 0x0C);
+			LIST_ENTRY* head = (LIST_ENTRY*)(ldr + 0x14);
+			LIST_ENTRY* node = head->Flink;
+
+			while (node != head && g_moduleCount < 512)
 			{
-				const BYTE* xmm = &ctx->ExtendedRegisters[160 + i * 16];
-				DWORD d0 = *(DWORD*)&xmm[0];
-				DWORD d1 = *(DWORD*)&xmm[4];
-				DWORD d2 = *(DWORD*)&xmm[8];
-				DWORD d3 = *(DWORD*)&xmm[12];
-				float f0 = *(float*)&d0;
-				float f1 = *(float*)&d1;
-				float f2 = *(float*)&d2;
-				float f3 = *(float*)&d3;
-				WriteFmt(file,
-					"  XMM%d = %08X %08X %08X %08X   [ %g %g %g %g ]\r\n",
-					i, d0, d1, d2, d3, f0, f1, f2, f3);
+				BYTE* entry = (BYTE*)node - 0x08;
+				BYTE* base = *(BYTE**)(entry + 0x18);
+				DWORD size = *(DWORD*)(entry + 0x20);
+				USHORT nameLen = *(USHORT*)(entry + 0x24);
+				wchar_t* nameBuf = *(wchar_t**)(entry + 0x28);
+
+				wchar_t fullName[MAX_PATH];
+				USHORT chars = (USHORT)(nameLen / sizeof(wchar_t));
+				if (chars >= MAX_PATH)
+				{
+					chars = MAX_PATH - 1;
+				}
+				for (USHORT j = 0; j < chars; j++)
+				{
+					fullName[j] = nameBuf[j];
+				}
+				fullName[chars] = 0;
+
+				WriteFmt(file, "  0x%08X - 0x%08X  %ls\r\n",
+					(unsigned)(DWORD_PTR)base,
+					(unsigned)((DWORD_PTR)base + size),
+					fullName);
+
+				const wchar_t* leaf = fullName;
+				const wchar_t* slash = wcsrchr(fullName, L'\\');
+				if (slash)
+				{
+					leaf = slash + 1;
+				}
+
+				ModuleEntry* m = &g_modules[g_moduleCount];
+				m->base = (DWORD_PTR)base;
+				m->size = size;
+				int k = 0;
+				while (leaf[k] && k < 63)
+				{
+					m->name[k] = (char)leaf[k];
+					k++;
+				}
+				m->name[k] = 0;
+
+				g_moduleCount++;
+				node = node->Flink;
 			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+		}
+	}
+
+	static void WriteRawStack(HANDLE file, CONTEXT* ctx)
+	{
+		WriteStr(file, "\r\n=== Raw Stack Scan ===\r\n");
+
+		static char addrStr[256];
+
+		__try
+		{
+			DWORD_PTR* sp = (DWORD_PTR*)ctx->Esp;
+			int printed = 0;
+
+			for (int i = 0; i < 8192 && printed < 64; i++)
+			{
+				if (g_crashStackBase && (DWORD_PTR)&sp[i] >= g_crashStackBase)
+				{
+					break;
+				}
+
+				DWORD_PTR value = sp[i];
+
+				if (IsAddressInModule(value) && IsAddressInModule(value - 8) && IsPrecededByCall(value))
+				{
+					FormatAddress(value, addrStr, sizeof(addrStr));
+					WriteFmt(file, "  [esp+0x%04X]  %s\r\n", (unsigned)(i * sizeof(DWORD_PTR)), addrStr);
+					printed++;
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
 		}
 	}
 
@@ -210,126 +403,195 @@ namespace CrashHandler
 		HANDLE process = GetCurrentProcess();
 		HANDLE thread = GetCurrentThread();
 
-		SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_NO_PROMPTS | SYMOPT_FAIL_CRITICAL_ERRORS);
-		SymInitialize(process, nullptr, TRUE);
+		static char addrStr[256];
+		static char line[1024];
 
-		STACKFRAME64 frame{};
-		frame.AddrPC.Offset = ctx->Eip;
-		frame.AddrPC.Mode = AddrModeFlat;
-		frame.AddrFrame.Offset = ctx->Ebp;
-		frame.AddrFrame.Mode = AddrModeFlat;
-		frame.AddrStack.Offset = ctx->Esp;
-		frame.AddrStack.Mode = AddrModeFlat;
-
-		int frameNum = 0;
-		int totalWalked = 0;
-
-		while (StackWalk64(IMAGE_FILE_MACHINE_I386, process, thread, &frame, ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+		__try
 		{
-			if (frame.AddrPC.Offset == 0)
+			SymRefreshModuleList(process);
+
+			STACKFRAME64 frame{};
+			frame.AddrPC.Offset = ctx->Eip;
+			frame.AddrPC.Mode = AddrModeFlat;
+			frame.AddrFrame.Offset = ctx->Ebp;
+			frame.AddrFrame.Mode = AddrModeFlat;
+			frame.AddrStack.Offset = ctx->Esp;
+			frame.AddrStack.Mode = AddrModeFlat;
+
+			int frameNum = 0;
+
+			while (StackWalk64(IMAGE_FILE_MACHINE_I386, process, thread, &frame, ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
 			{
-				break;
-			}
+				if (frame.AddrPC.Offset == 0)
+				{
+					break;
+				}
 
-			if (++totalWalked > 128)
-			{
-				break;
-			}
+				FormatAddress((DWORD_PTR)frame.AddrPC.Offset, addrStr, sizeof(addrStr));
 
-			if (!IsAddressInModule((DWORD_PTR)frame.AddrPC.Offset))
-			{
-				continue;
-			}
+				char symBuf[sizeof(SYMBOL_INFO) + 256]{};
+				SYMBOL_INFO* sym = (SYMBOL_INFO*)symBuf;
+				sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+				sym->MaxNameLen = 255;
+				DWORD64 displacement = 0;
 
-			char addrStr[256];
-			FormatAddress((DWORD_PTR)frame.AddrPC.Offset, addrStr, sizeof(addrStr));
+				if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, sym) && displacement < 0x10000)
+				{
+					_snprintf_s(line, _countof(line), _TRUNCATE, "  #%02d  %s   %s+0x%llx\r\n", frameNum, addrStr, sym->Name, displacement);
+				}
+				else
+				{
+					_snprintf_s(line, _countof(line), _TRUNCATE, "  #%02d  %s\r\n", frameNum, addrStr);
+				}
 
-			char symBuf[sizeof(SYMBOL_INFO) + 256]{};
-			SYMBOL_INFO* sym = (SYMBOL_INFO*)symBuf;
-			sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-			sym->MaxNameLen = 255;
-			DWORD64 displacement = 0;
+				WriteStr(file, line);
+				frameNum++;
 
-			char line[1024];
-			if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, sym))
-			{
-				sprintf_s(line, "  #%02d  %s   %s+0x%llx\r\n", frameNum, addrStr, sym->Name, displacement);
-			}
-			else
-			{
-				sprintf_s(line, "  #%02d  %s\r\n", frameNum, addrStr);
-			}
-
-			WriteStr(file, line);
-			frameNum++;
-
-			if (frameNum > 64)
-			{
-				break;
+				if (frameNum > 64)
+				{
+					break;
+				}
 			}
 		}
-
-		SymCleanup(process);
-	}
-
-	static void WriteModuleList(HANDLE file)
-	{
-		WriteStr(file, "\r\n=== Loaded Modules ===\r\n");
-
-		if (!g_EnumProcessModules || !g_GetModuleFileNameEx || !g_GetModuleInformation)
+		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
-			return;
-		}
-
-		HMODULE mods[1024];
-		DWORD needed = 0;
-
-		if (!g_EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
-		{
-			return;
-		}
-
-		DWORD count = needed / sizeof(HMODULE);
-		for (DWORD i = 0; i < count; i++)
-		{
-			char path[MAX_PATH];
-			if (!g_GetModuleFileNameEx(GetCurrentProcess(), mods[i], path, MAX_PATH))
-			{
-				continue;
-			}
-
-			MODULEINFO mi{};
-			g_GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi));
-
-			WriteFmt(file, "  0x%08X - 0x%08X  %s\r\n",
-				(unsigned)(DWORD_PTR)mi.lpBaseOfDll,
-				(unsigned)((DWORD_PTR)mi.lpBaseOfDll + mi.SizeOfImage),
-				path);
 		}
 	}
 
-	static void WriteCrashReport(EXCEPTION_POINTERS* ep, const char* sourceTag)
+	static HANDLE OpenReportFile(wchar_t* outPath, size_t outCount)
 	{
-		if (InterlockedExchange(&g_reportWritten, 1) != 0)
-		{
-			return;
-		}
-
 		wchar_t exePath[MAX_PATH];
-		GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-		RemoveFileSpecW(exePath);
+		if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+		{
+			exePath[0] = 0;
+		}
 
-		wchar_t dumpDir[MAX_PATH];
-		swprintf_s(dumpDir, L"%s\\CrashDump", exePath);
-		CreateDirectoryW(dumpDir, nullptr);
+		wchar_t exeName[MAX_PATH];
+		const wchar_t* leaf = exePath;
+		const wchar_t* slash = wcsrchr(exePath, L'\\');
+		if (slash)
+		{
+			leaf = slash + 1;
+		}
+		_snwprintf_s(exeName, _countof(exeName), _TRUNCATE, L"%s", leaf);
+		wchar_t* dot = wcsrchr(exeName, L'.');
+		if (dot)
+		{
+			*dot = 0;
+		}
+		if (exeName[0] == 0)
+		{
+			_snwprintf_s(exeName, _countof(exeName), _TRUNCATE, L"Game");
+		}
+
+		wchar_t exeDir[MAX_PATH];
+		_snwprintf_s(exeDir, _countof(exeDir), _TRUNCATE, L"%s", exePath);
+		RemoveFileSpecW(exeDir);
 
 		SYSTEMTIME st;
 		GetLocalTime(&st);
 
-		wchar_t txtPath[MAX_PATH];
-		swprintf_s(txtPath, L"%s\\crash_%04d%02d%02d_%02d%02d%02d.txt", dumpDir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+		wchar_t bases[3][MAX_PATH];
+		int baseCount = 0;
 
-		HANDLE file = CreateFileW(txtPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (exeDir[0])
+		{
+			_snwprintf_s(bases[baseCount++], MAX_PATH, _TRUNCATE, L"%s", exeDir);
+		}
+
+		wchar_t localApp[MAX_PATH];
+		if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH))
+		{
+			_snwprintf_s(bases[baseCount++], MAX_PATH, _TRUNCATE, L"%s\\%s", localApp, exeName);
+		}
+
+		wchar_t tempDir[MAX_PATH];
+		if (GetTempPathW(MAX_PATH, tempDir))
+		{
+			_snwprintf_s(bases[baseCount++], MAX_PATH, _TRUNCATE, L"%s%s", tempDir, exeName);
+		}
+
+		for (int i = 0; i < baseCount; i++)
+		{
+			wchar_t dumpDir[MAX_PATH];
+			_snwprintf_s(dumpDir, _countof(dumpDir), _TRUNCATE, L"%s\\CrashDump", bases[i]);
+
+			CreateDirectoryW(bases[i], nullptr);
+			CreateDirectoryW(dumpDir, nullptr);
+
+			wchar_t path[MAX_PATH];
+			_snwprintf_s(path, _countof(path), _TRUNCATE,
+				L"%s\\crash_%04d%02d%02d_%02d%02d%02d_%03d_%lu.txt",
+				dumpDir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentProcessId());
+
+			HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (file != INVALID_HANDLE_VALUE)
+			{
+				_snwprintf_s(outPath, outCount, _TRUNCATE, L"%s", path);
+				return file;
+			}
+		}
+
+		if (outCount)
+		{
+			outPath[0] = 0;
+		}
+
+		return INVALID_HANDLE_VALUE;
+	}
+
+	static bool WriteMiniDump(EXCEPTION_POINTERS* ep, const wchar_t* txtPath)
+	{
+		wchar_t dmpPath[MAX_PATH];
+		_snwprintf_s(dmpPath, _countof(dmpPath), _TRUNCATE, L"%s", txtPath);
+
+		wchar_t* dot = wcsrchr(dmpPath, L'.');
+		if (!dot || wcslen(dot) != 4)
+		{
+			return false;
+		}
+
+		dot[1] = L'd';
+		dot[2] = L'm';
+		dot[3] = L'p';
+
+		HANDLE file = CreateFileW(dmpPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE)
+		{
+			return false;
+		}
+
+		MINIDUMP_EXCEPTION_INFORMATION mei;
+		mei.ThreadId = g_crashThreadId;
+		mei.ExceptionPointers = ep;
+		mei.ClientPointers = FALSE;
+
+		MINIDUMP_TYPE dumpType = (MINIDUMP_TYPE)(
+			MiniDumpWithDataSegs |
+			MiniDumpWithHandleData |
+			MiniDumpWithIndirectlyReferencedMemory |
+			MiniDumpWithUnloadedModules |
+			MiniDumpWithThreadInfo);
+
+		BOOL ok = FALSE;
+
+		__try
+		{
+			ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file, dumpType, &mei, nullptr, nullptr);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+		}
+
+		CloseHandle(file);
+
+		return ok != FALSE;
+	}
+
+	static void WriteCrashReport(EXCEPTION_POINTERS* ep, const char* sourceTag)
+	{
+		wchar_t txtPath[MAX_PATH];
+		HANDLE file = OpenReportFile(txtPath, _countof(txtPath));
 		if (file == INVALID_HANDLE_VALUE)
 		{
 			return;
@@ -338,21 +600,23 @@ namespace CrashHandler
 		EXCEPTION_RECORD* er = ep->ExceptionRecord;
 		CONTEXT* ctx = ep->ContextRecord;
 
-		char addrStr[256];
-		FormatAddress((DWORD_PTR)er->ExceptionAddress, addrStr, sizeof(addrStr));
+		SYSTEMTIME st;
+		GetLocalTime(&st);
 
 		WriteFmt(file,
 			"=== Crash Report ===\r\n"
 			"Source:     %s\r\n"
 			"Time:       %04d-%02d-%02d %02d:%02d:%02d\r\n"
 			"Exception:  0x%08X (%s)\r\n"
-			"Address:    %s\r\n"
+			"Address:    0x%08X\r\n"
+			"ProcessId:  %lu\r\n"
 			"ThreadId:   %lu\r\n",
 			sourceTag,
 			st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
 			(unsigned)er->ExceptionCode,
 			ExceptionCodeName(er->ExceptionCode),
-			addrStr,
+			(unsigned)(DWORD_PTR)er->ExceptionAddress,
+			GetCurrentProcessId(),
 			GetCurrentThreadId());
 
 		if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
@@ -367,45 +631,116 @@ namespace CrashHandler
 		}
 
 		WriteRegisters(file, ctx);
+		FlushFileBuffers(file);
+
+		WriteModuleList(file);
+		FlushFileBuffers(file);
+
+		static char faultStr[256];
+		FormatAddress((DWORD_PTR)er->ExceptionAddress, faultStr, sizeof(faultStr));
+		WriteFmt(file, "\r\nFaulting:   %s\r\n", faultStr);
+
+		WriteRawStack(file, ctx);
+		FlushFileBuffers(file);
 
 		WriteStr(file, "\r\n=== Stack Trace ===\r\n");
 		CONTEXT ctxCopy = *ctx;
 		WriteStackTrace(file, &ctxCopy);
-
-		WriteModuleList(file);
+		FlushFileBuffers(file);
 
 		CloseHandle(file);
 
-		wchar_t msg[1024];
-		swprintf_s(msg,
+		bool dumpOk = WriteMiniDump(ep, txtPath);
+
+		static wchar_t msg[1024];
+		_snwprintf_s(msg, _countof(msg), _TRUNCATE,
 			L"The game has crashed.\n\n"
 			L"Exception: 0x%08X (%hs)\n"
 			L"At: %hs\n\n"
-			L"Crash report saved to:\n%s",
+			L"%s\n"
+			L"Crash report saved to:\n%s%s",
 			(unsigned)er->ExceptionCode,
 			ExceptionCodeName(er->ExceptionCode),
-			addrStr,
-			txtPath);
-		MessageBoxW(nullptr, msg, L"Game Crash", MB_OK | MB_ICONERROR | MB_TOPMOST);
+			faultStr,
+			g_terminateOnCrash ? L"The game will close when you press OK." : L"The process has been paused for debugging.",
+			txtPath,
+			dumpOk ? L"\n\nA minidump (.dmp) was saved next to it." : L"");
+		MessageBoxW(nullptr, msg, L"Game Crash", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST);
+
+		if (g_terminateOnCrash)
+		{
+			TerminateProcess(GetCurrentProcess(), er->ExceptionCode);
+		}
+	}
+
+	static DWORD WINAPI WriterThread(LPVOID)
+	{
+		g_writerThreadId = GetCurrentThreadId();
+		WriteCrashReport(g_crashEp, g_crashTag);
+		g_writerThreadId = 0;
+		return 0;
+	}
+
+	static void HandleCrash(EXCEPTION_POINTERS* ep, const char* sourceTag)
+	{
+		if (InterlockedExchange(&g_reportWritten, 1) != 0)
+		{
+			Sleep(INFINITE);
+			return;
+		}
+
+		g_crashEp = ep;
+		g_crashTag = sourceTag;
+		g_crashThreadId = GetCurrentThreadId();
+		g_crashStackBase = __readfsdword(0x04);
+
+		HANDLE thread = CreateThread(nullptr, 0, WriterThread, nullptr, 0, nullptr);
+		if (thread)
+		{
+			CloseHandle(thread);
+		}
+		else
+		{
+			g_writerThreadId = GetCurrentThreadId();
+			WriteCrashReport(ep, sourceTag);
+			g_writerThreadId = 0;
+		}
+
+		Sleep(INFINITE);
 	}
 
 	static LONG WINAPI VectoredCrashFilter(EXCEPTION_POINTERS* ep)
 	{
+		if (g_reportWritten && GetCurrentThreadId() == g_writerThreadId)
+		{
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
 		if (!IsFatalCode(ep->ExceptionRecord->ExceptionCode))
 		{
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
-		WriteCrashReport(ep, "VEH");
+		if (IsDebuggerPresent())
+		{
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
+		HandleCrash(ep, "VEH");
 
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
 	static LONG WINAPI UnhandledCrashFilter(EXCEPTION_POINTERS* ep)
 	{
-		WriteCrashReport(ep, "Unhandled");
+		if (IsDebuggerPresent())
+		{
+			return g_previousFilter ? g_previousFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+		}
 
-		return g_previousFilter ? g_previousFilter(ep) : EXCEPTION_EXECUTE_HANDLER;
+		HandleCrash(ep, "Unhandled");
+
+		return EXCEPTION_EXECUTE_HANDLER;
 	}
 
 	static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilterStub(LPTOP_LEVEL_EXCEPTION_FILTER)
@@ -440,20 +775,48 @@ namespace CrashHandler
 		}
 	}
 
-	static void Install(bool useVEH = true)
+	static void __cdecl OnInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, uintptr_t)
 	{
-		SetErrorMode(SEM_NOGPFAULTERRORBOX);
+		RaiseException(CODE_CRT_INVALID_PARAMETER, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+	}
 
+	static void __cdecl OnPurecall()
+	{
+		RaiseException(CODE_CRT_PURECALL, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+	}
+
+	static void __cdecl OnTerminate()
+	{
+		RaiseException(CODE_CRT_TERMINATE, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+	}
+
+	static void __cdecl OnAbort(int)
+	{
+		RaiseException(CODE_CRT_ABORT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+	}
+
+	static void GuardThreadStack()
+	{
 		ULONG stackReserve = 64 * 1024;
 		SetThreadStackGuarantee(&stackReserve);
+	}
 
-		g_psapi = LoadLibraryA("psapi.dll");
-		if (g_psapi)
-		{
-			g_EnumProcessModules = (EnumProcessModulesFn)GetProcAddress(g_psapi, "EnumProcessModules");
-			g_GetModuleFileNameEx = (GetModuleFileNameExFn)GetProcAddress(g_psapi, "GetModuleFileNameExA");
-			g_GetModuleInformation = (GetModuleInformationFn)GetProcAddress(g_psapi, "GetModuleInformation");
-		}
+	static void Install(bool useVEH = true, bool terminateOnCrash = false)
+	{
+		g_terminateOnCrash = terminateOnCrash;
+
+		SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
+
+		_set_invalid_parameter_handler(OnInvalidParameter);
+		_set_purecall_handler(OnPurecall);
+		std::set_terminate(OnTerminate);
+		_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+		signal(SIGABRT, OnAbort);
+
+		GuardThreadStack();
+
+		SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_NO_PROMPTS | SYMOPT_FAIL_CRITICAL_ERRORS);
+		SymInitialize(GetCurrentProcess(), nullptr, TRUE);
 
 		g_previousFilter = SetUnhandledExceptionFilter(UnhandledCrashFilter);
 
@@ -476,13 +839,6 @@ namespace CrashHandler
 		SetUnhandledExceptionFilter(g_previousFilter);
 		g_previousFilter = nullptr;
 
-		if (g_psapi)
-		{
-			FreeLibrary(g_psapi);
-			g_psapi = nullptr;
-			g_EnumProcessModules = nullptr;
-			g_GetModuleFileNameEx = nullptr;
-			g_GetModuleInformation = nullptr;
-		}
+		SymCleanup(GetCurrentProcess());
 	}
 }
