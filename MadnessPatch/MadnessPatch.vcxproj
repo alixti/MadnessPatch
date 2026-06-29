@@ -111,6 +111,7 @@
     <ClCompile Include="..\include\SDK\SDK_HEADERS\WinDrv_classes.cpp" />
     <ClCompile Include="..\include\SDK\SDK_HEADERS\XAudio2_classes.cpp" />
     <ClCompile Include="..\src\dllmain.cpp" />
+    <ClCompile Include="..\src\EnableDLCWeaponsOnMapChange.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="MadnessPatch.ini">
@@ -121,6 +122,7 @@
   <ItemGroup>
     <ClInclude Include="..\include\Controller.hpp" />
     <ClInclude Include="..\include\CrashHandler.hpp" />
+    <ClInclude Include="..\include\EnableDLCWeaponsOnMapChange.hpp" />
     <ClInclude Include="..\include\FixIniBindings.hpp" />
     <ClInclude Include="..\include\ini.hpp" />
     <ClInclude Include="..\include\MFortress\Patches_EA.hpp" />

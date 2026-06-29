@@ -16,6 +16,7 @@
 #include "helper.hpp"
 #include "FixIniBindings.hpp"
 #include "CrashHandler.hpp"
+#include "EnableDLCWeaponsOnMapChange.hpp"
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "SDL3-static.lib")
@@ -144,6 +145,7 @@ int MaxProcessorCount = 0;
 
 // General
 bool UnlockCompleteEditionDLC = false;
+bool EnableDLCWeaponsOnMapChange = false;
 bool DisableLegacyDriverHacks = false;
 bool CheckAlice1InstallFolder = false;
 bool SkipEAIntro = false;
@@ -247,6 +249,7 @@ static void ReadConfig()
 	
 	// General
 	UnlockCompleteEditionDLC = IniHelper::ReadInteger("General", "UnlockCompleteEditionDLC", 1) == 1;
+	EnableDLCWeaponsOnMapChange = IniHelper::ReadInteger("General", "EnableDLCWeaponsOnMapChange", 0) == 1;
 	DisableLegacyDriverHacks = IniHelper::ReadInteger("General", "DisableLegacyDriverHacks", 1) == 1;
 	CheckAlice1InstallFolder = IniHelper::ReadInteger("General", "CheckAlice1InstallFolder", 1) == 1;
 	SkipEAIntro = IniHelper::ReadInteger("General", "SkipEAIntro", 0) == 1;
@@ -1599,6 +1602,13 @@ static void ApplyCheckAlice1InstallFolder()
 	);
 }
 
+static void ApplyEnableDLCWeaponsOnMapChange()
+{
+	if (!EnableDLCWeaponsOnMapChange) return;
+
+	EnableDLCWeaponsFix::Install(g_State.GameModule, reinterpret_cast<uintptr_t>(&g_State.pInput));
+}
+
 static void ApplyFontScaling()
 {
 	if (!FontScaling) return;
@@ -1906,7 +1916,7 @@ static void ApplyResolutionHook()
 
 static void ApplyGetPointerHook()
 {
-	if (!DisableMouseAcceleration && !FixUltraWideScreenFOV && !DisableBackgroundLevelStreaming) return;
+	if (!DisableMouseAcceleration && !FixUltraWideScreenFOV && !DisableBackgroundLevelStreaming && !EnableDLCWeaponsOnMapChange) return;
 
 	DWORD addr_PlayActorPtr = ScanModuleSignature(g_State.GameModule, "89 47 40 8B 45 ?? 88 5D FC 89 5D ?? 89 5D ?? 3B C3 74 0E 6A 01 50 E8 ?? ?? ?? ?? 83 C4 08 89 5D", "PlayActorPtr");
 	DWORD addr_UpdatePlayActorPtr = ScanModuleSignature(g_State.GameModule, "2C 02 00 00 ?? ?? 14 06 00 00", "UpdatePlayActorPtr");
@@ -1985,6 +1995,7 @@ static void Init()
 	ApplyIniSettingsHook();
 	ApplyIntroSkip();
 	ApplyCheckAlice1InstallFolder();
+	ApplyEnableDLCWeaponsOnMapChange();
 
 	// Display
 	ApplyFontScaling();
@@ -2082,6 +2093,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 		}
 		case DLL_PROCESS_DETACH:
 		{
+			EnableDLCWeaponsFix::Stop();
 			break;
 		}
 	}
