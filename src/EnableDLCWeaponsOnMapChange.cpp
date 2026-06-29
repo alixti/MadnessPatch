@@ -2,8 +2,6 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
-#include <atomic>
-#include <thread>
 #include <cstring>
 
 #include "EnableDLCWeaponsOnMapChange.hpp"
@@ -13,8 +11,11 @@ namespace EnableDLCWeaponsFix
 {
 	namespace
 	{
-		std::atomic<bool> g_running{ false };
-		std::atomic<bool> g_stop{ false };
+		uintptr_t g_controllerSlot = 0;
+		APlayerController* g_lastController = nullptr;
+		UFunction* g_enableFunction = nullptr;
+		DWORD g_changeTime = 0;
+		int g_fireStage = 0;
 
 		bool IsReadable(const void* ptr, size_t size)
 		{
@@ -73,94 +74,68 @@ namespace EnableDLCWeaponsFix
 			}
 		}
 
-		bool EnableDLCWeapons(APlayerController* Controller, UFunction*& Function)
+		void EnableDLCWeapons(APlayerController* Controller)
 		{
 			__try
 			{
-				if (!Function)
+				if (!g_enableFunction)
 				{
-					Function = FindFunction(Controller, "EnableAllDLCWeapons");
+					g_enableFunction = FindFunction(Controller, "EnableAllDLCWeapons");
 				}
 
-				if (!Function)
+				if (g_enableFunction)
 				{
-					return false;
+					unsigned char params[8] = { 0 };
+					Controller->ProcessEvent(g_enableFunction, params, nullptr);
 				}
-
-				unsigned char params[8] = { 0 };
-				Controller->ProcessEvent(Function, params, nullptr);
-				return true;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
-				return false;
 			}
-		}
-
-		void Watch(uintptr_t controllerSlot)
-		{
-			UFunction* enableFunction = nullptr;
-			APlayerController* lastController = nullptr;
-			bool pending = false;
-			int ticks = 0;
-
-			while (!g_stop.load(std::memory_order_relaxed))
-			{
-				Sleep(250);
-
-				APlayerController* controller = ReadController(controllerSlot);
-				if (!controller)
-				{
-					continue;
-				}
-
-				if (controller != lastController)
-				{
-					lastController = controller;
-					pending = true;
-					ticks = 0;
-				}
-
-				if (!pending)
-				{
-					continue;
-				}
-
-				++ticks;
-
-				if (ticks == 2 || ticks == 20 || ticks == 40)
-				{
-					EnableDLCWeapons(controller, enableFunction);
-				}
-
-				if (ticks >= 40)
-				{
-					pending = false;
-				}
-			}
-
-			g_running.store(false, std::memory_order_relaxed);
 		}
 	}
 
 	void Install(HMODULE gameModule, uintptr_t playerControllerSlot)
 	{
-		if (!gameModule || !playerControllerSlot || g_running.exchange(true))
-		{
+		if (!gameModule || !playerControllerSlot)
 			return;
-		}
 
 		GNames = reinterpret_cast<TArray<FNameEntry*>*>(reinterpret_cast<uintptr_t>(gameModule) + static_cast<uintptr_t>(GNames_Offset));
-
-		HMODULE pinned = nullptr;
-		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&Watch), &pinned);
-
-		g_stop.store(false, std::memory_order_relaxed);
-		std::thread(Watch, playerControllerSlot).detach();
+		g_controllerSlot = playerControllerSlot;
 	}
 
-	void Stop()
+	void Tick()
 	{
-		g_stop.store(true, std::memory_order_relaxed);
+		if (!g_controllerSlot)
+			return;
+
+		APlayerController* controller = ReadController(g_controllerSlot);
+		if (!controller)
+			return;
+
+		if (controller != g_lastController)
+		{
+			g_lastController = controller;
+			g_changeTime = GetTickCount();
+			g_fireStage = 0;
+		}
+
+		const DWORD elapsed = GetTickCount() - g_changeTime;
+
+		if (g_fireStage == 0 && elapsed >= 500)
+		{
+			EnableDLCWeapons(controller);
+			g_fireStage = 1;
+		}
+		else if (g_fireStage == 1 && elapsed >= 5000)
+		{
+			EnableDLCWeapons(controller);
+			g_fireStage = 2;
+		}
+		else if (g_fireStage == 2 && elapsed >= 10000)
+		{
+			EnableDLCWeapons(controller);
+			g_fireStage = 3;
+		}
 	}
 }

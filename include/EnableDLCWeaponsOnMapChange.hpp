@@ -6,5 +6,5 @@
 namespace EnableDLCWeaponsFix
 {
 	void Install(HMODULE gameModule, uintptr_t playerControllerSlot);
-	void Stop();
+	void Tick();
 }

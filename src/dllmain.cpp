@@ -658,6 +658,11 @@ static SafetyHookInline GetMaxTickRate{};
 
 static double __fastcall GetMaxTickRate_Hook(int thisp, int, float a2, int a3)
 {
+	if (EnableDLCWeaponsOnMapChange)
+	{
+		EnableDLCWeaponsFix::Tick();
+	}
+
 	if (g_State.set40fps != g_State.prev_set40fps)
 	{
 		if (g_State.set40fps)
@@ -1607,6 +1612,18 @@ static void ApplyEnableDLCWeaponsOnMapChange()
 	if (!EnableDLCWeaponsOnMapChange) return;
 
 	EnableDLCWeaponsFix::Install(g_State.GameModule, reinterpret_cast<uintptr_t>(&g_State.pInput));
+
+	// The DLC weapons must be re-enabled from the game thread, so drive it from
+	// the per-frame GetMaxTickRate hook (shared with FixHashTableRaceCondition).
+	if (!GetMaxTickRate)
+	{
+		DWORD addr_GetMaxTickRate = ScanModuleSignature(g_State.GameModule, "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 83 EC 14 56 A1 ?? ?? ?? ?? 33 C5 50 8D 45 F4 64 A3 00 00 00 00 8B F1 C7 45 EC 00 00 00 00 F7", "DLCWeapons_GetMaxTickRate");
+
+		if (addr_GetMaxTickRate != 0)
+		{
+			GetMaxTickRate = HookHelper::CreateHook((void*)addr_GetMaxTickRate, &GetMaxTickRate_Hook);
+		}
+	}
 }
 
 static void ApplyFontScaling()
@@ -2093,7 +2110,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 		}
 		case DLL_PROCESS_DETACH:
 		{
-			EnableDLCWeaponsFix::Stop();
 			break;
 		}
 	}
